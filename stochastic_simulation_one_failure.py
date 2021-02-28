@@ -13,6 +13,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import wntr
+import networkx as nx
 
 # Crear el modelo de la red de agua
 num_fugas = 1 # numero de fugas simultaneas
@@ -28,77 +29,107 @@ wn.options.time.report_timestep = intervalo_tiempo #cada media hora registra res
 wn.options.hydraulic.required_pressure = 15 # Revisar las unidades de la presion
 wn.options.hydraulic.minimum_pressure = 0
 
-# Define failure probability for each pipe, based on pipe diameter. Failure
-# probability must sum to 1.  Net3 has a few pipes with diameter = 99 inches,
-# to exclude these from the set of feasible leak locations, use
-# query_link_attribute
-pipe_diameters = wn.query_link_attribute('diameter', np.less_equal,
-                                         0.9144,  # 36 inches = 0.9144 m
-                                         link_type=wntr.network.Pipe)
-failure_probability = pipe_diameters/pipe_diameters.sum()
+# Representamos la RDA como un grafo simple no dirigido para calcular sus
+# metricas de resilencia topografica
+G = wn.get_graph() # directed multigraph
+uG = G.to_undirected() # undirected multigraph
+sG = nx.Graph(uG) # undirected simple graph
 
-# Pickle the network model and reload it for each realization
+#############################################################################
+# Definimos la probabilidad de fuga de una tuberia basado en el grado de sus 
+# nodos incidentes, la suma de las probabilidades de las tuberias debe ser 1
+
+# Calculamos el grado para cada nodo
+node_degree = G.degree()
+# itera entre todos los nodos de la red y les asignamos a cada uno como un atrbuto
+# su grado
+for node_name, node in wn.nodes():
+    node.grado = node_degree[node_name]
+
+# Le asignamos a cada tuberia el valor del grado
+for pipe_name, pipe in wn.pipes(): # iteramos en la tuberia
+    start_node = wn.get_node(pipe.start_node)   # obtenemos el nodo inicial
+    end_node = wn.get_node(pipe.end_node)       # obtenemos el nodo final 
+    # el grado de la tuberia sera la suma de los grados de sus nodos entre 2
+    pipe.grado = (start_node.grado + end_node.grado) / 2 
+
+# asignamos probabilidad de fallo a cada tubería
+# obtenemos una lista con los grado de cada tuberia
+tuberia_grados = wn.query_link_attribute('grado',link_type=wntr.network.Pipe)
+# a cada elemento de la lista de grados lo divide entre la suma de grados
+# asi obtiene una lista de probabilidades de fallo
+failure_probability = tuberia_grados/tuberia_grados.sum()
+##############################################################################
+
 # guarda una copia del modelo de red en f
 f=open('wn.pickle','wb')
 pickle.dump(wn,f)
 f.close()
 
-# Run num_fallos realizations
-results = {} # Initialize dictionary to store results
-np.random.seed(67823) # Set random seed
-for i in range(num_fallos):
+# Ejecuta el exprimento el numero de veces indicado en num_experimentos
+num_experimentos = 2
+results = {} # almacena los resultados de cada experimento
+np.random.seed(67823) # Hace que en cada exprimento se elija una tubería diferente
 
-    # Select the number of leaks, random value between 1 and num_fallos
-    N = np.random.randint(1,num_fallos+1)
+# ejecuta los experimentos
+for i in range(num_experimentos):
 
-    # Select N unique pipes based on failure probability
-    pipes_to_fail = np.random.choice(failure_probability.index, num_fallos,
+    # Con base en la probabilidad de fuga selecciona la tuberia que tendra fuga
+    pipes_to_fail = np.random.choice(failure_probability.index, num_fugas,
                                      replace=False,
                                      p=failure_probability.values)
 
-    # Select time of failure, uniform dist, between 1 and 10 hours
+    # Selecciona el tiempo en que comienza la fuga (entre 1 y 10 am)
     time_of_failure = np.round(np.random.uniform(1,10,1)[0], 2)
 
-    # Select duration of failure, uniform dist, between 12 and 24 hours
+    # Selecciona la duracion de la fuga entre 12 y 24hrs
     duration_of_failure = np.round(np.random.uniform(12,24,1)[0], 2)
     
-    # Add leaks to the model
+    # Agrega las fugas al modelo
     for pipe_to_fail in pipes_to_fail:
         pipe = wn.get_link(pipe_to_fail)
+        # el diamtero de la fuga es una tercera parte del diametro de la tuberia
         leak_diameter = pipe.diameter*0.3
+        # calcula el area de la fuga
         leak_area=3.14159*(leak_diameter/2)**2
+        #agrega la fuga en el tiempo y con la duracion estimada
         wn = wntr.morph.split_pipe(wn, pipe_to_fail, pipe_to_fail + '_B', pipe_to_fail+'leak_node')
         leak_node = wn.get_node(pipe_to_fail+'leak_node')
         leak_node.add_leak(wn, area=leak_area,
                           start_time=time_of_failure*3600,
                           end_time=(time_of_failure + duration_of_failure)*3600)
 
-    # Simulate hydraulics and store results
-    wn.options.hydraulic.demand_model = 'PDD'
+    # realiza la simulacion hidraulica
+    wn.options.hydraulic.demand_model = 'PDD' # establece el modelo de demanda
     sim = wntr.sim.WNTRSimulator(wn)
-    print('Pipe Breaks: ' + str(pipes_to_fail) + ', Start Time: ' + \
-                str(time_of_failure) + ', End Time: ' + \
+    print('Tuberia con fuga : ' + str(pipes_to_fail) + ', La fuga comenzo a las: ' + \
+                str(time_of_failure) + ', y termino: ' + \
                 str(time_of_failure+duration_of_failure))
+    # almacena resultados de la simulacion
     results[i] = sim.run_sim()
     
-    # Reload the water network model
+    # Usa una copia del modelo de la red
     f=open('wn.pickle','rb')
     wn = pickle.load(f)
     f.close()
 
-# Plot water service availability and tank water level for each realization
+# Grafica los resultados: 1) disponibilidad de servicio de agua en cada nodo y
+# nivel de agua en cada tanque
 for i in results.keys():
     
-    # Water service availability at each junction and time
+    # calcula la demanda esperada en cada nodo (varia en el tiempo)
     expected_demand = wntr.metrics.expected_demand(wn)
+    # calcula la demanda real en cada nodo (varia en el tiempo)
     demand = results[i].node['demand'].loc[:,wn.junction_name_list]
+    # a partir de la demanda esperada y la demanda real (demanda real / demanda esperada)
+    # calcula la disponibilidad del servicio de agua (wsa)
     wsa_nt = wntr.metrics.water_service_availability(expected_demand, demand)
     
-    # Average water service availability at each time
+    # Promedio de la disponibilidad de servicio de agua en todos los nodos
     wsa_t = wntr.metrics.water_service_availability(expected_demand.sum(axis=1), 
                                                   demand.sum(axis=1))
                                
-    # Tank water level
+    # Obtiene el nivel de agua en cada tanque
     tank_level = results[i].node['pressure'].loc[:,wn.tank_name_list]
     
     
