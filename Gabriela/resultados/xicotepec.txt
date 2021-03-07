@@ -1,0 +1,1 @@
+grado Tubería con fuga: ['T920'], Inicio de la fuga: 7.01, Termino de la figa: 13.79
